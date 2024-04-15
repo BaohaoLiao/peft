@@ -99,8 +99,11 @@ class LoraLayer(BaseTunerLayer):
 
         self.lora_dropout.update(nn.ModuleDict({adapter_name: lora_dropout_layer}))
         # Actual trainable parameters
-        self.lora_A[adapter_name] = nn.Linear(self.in_features, r, bias=False)
-        self.lora_B[adapter_name] = nn.Linear(r, self.out_features, bias=False)
+        #self.lora_A[adapter_name] = nn.Linear(self.in_features, r, bias=False)
+        #self.lora_B[adapter_name] = nn.Linear(r, self.out_features, bias=False)
+        self.lora_A[adapter_name] = nn.Linear(self.out_features//2, 1, bias=False)
+        self.lora_B[adapter_name] = nn.Linear(self.out_features//2, 1, bias=False)
+
         if use_rslora:
             self.scaling[adapter_name] = lora_alpha / math.sqrt(r)
         else:
@@ -138,12 +141,16 @@ class LoraLayer(BaseTunerLayer):
             if init_lora_weights is True:
                 # initialize A the same way as the default for nn.Linear and B to zero
                 # https://github.com/microsoft/LoRA/blob/a0a92e0f26c067cf94747bdbf1ce73793fa44d19/loralib/layers.py#L124
-                nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(5))
+                # nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(5))
+                nn.init.zeros_(self.lora_A[adapter_name].weight)
+                nn.init.ones_(self.lora_B[adapter_name].weight)
             elif init_lora_weights.lower() == "gaussian":
-                nn.init.normal_(self.lora_A[adapter_name].weight, std=1 / self.r[adapter_name])
+                #nn.init.normal_(self.lora_A[adapter_name].weight, std=1 / self.r[adapter_name])
+                nn.init.normal_(self.lora_A[adapter_name].weight, std=0.02)
+                nn.init.normal_(self.lora_B[adapter_name].weight, mean=1.0, std=0.02)
             else:
                 raise ValueError(f"Unknown initialization {init_lora_weights=}")
-            nn.init.zeros_(self.lora_B[adapter_name].weight)
+            #nn.init.zeros_(self.lora_B[adapter_name].weight)
         if adapter_name in self.lora_embedding_A.keys():
             # initialize a the same way as the default for nn.linear and b to zero
             nn.init.zeros_(self.lora_embedding_A[adapter_name])
@@ -238,6 +245,18 @@ class LoraLayer(BaseTunerLayer):
         #     result = result + bias
 
         return result_dora
+    
+    def _apply_rosa(self, x, lora_A, lora_B, scaling):
+        lora_A_cos = lora_A.weight.squeeze().repeat_interleave(2).cos()
+        lora_A_sin = lora_A.weight.squeeze().repeat_interleave(2).sin()
+        lora_B_repeat = lora_B.weight.squeeze().repeat_interleave(2)
+
+        lora_A_cos = lora_B_repeat * lora_A_cos
+        lora_A_sin = lora_B_repeat * lora_A_sin
+    
+        rotate_half_x = torch.stack([-x[..., 1::2], x[..., ::2]], dim=-1).reshape_as(x)
+        result = x * lora_A_cos + rotate_half_x * lora_A_sin
+        return scaling * result
 
     def set_scale(self, adapter, scale):
         if adapter not in self.scaling:
@@ -508,12 +527,14 @@ class Linear(nn.Module, LoraLayer):
                     continue
                 lora_A = self.lora_A[active_adapter]
                 lora_B = self.lora_B[active_adapter]
+
                 dropout = self.lora_dropout[active_adapter]
                 scaling = self.scaling[active_adapter]
                 x = x.to(lora_A.weight.dtype)
 
                 if not self.use_dora[active_adapter]:
-                    result = result + lora_B(lora_A(dropout(x))) * scaling
+                    #result = result + lora_B(lora_A(dropout(x))) * scaling
+                    result = result + self._apply_rosa(x, lora_A, lora_B, scaling)
                 else:
                     x = dropout(x)
                     result = result + self._apply_dora(x, lora_A, lora_B, scaling, active_adapter)
